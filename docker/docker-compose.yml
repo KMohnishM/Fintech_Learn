@@ -1,0 +1,187 @@
+version: '3.8'
+
+services:
+  # ==========================================
+  # Relational Database: PostgreSQL 16
+  # ACID Double-Entry Ledger & LC State Machine
+  # ==========================================
+  postgres:
+    image: postgres:16-alpine
+    container_name: trade-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: trade_finance_db
+      POSTGRES_USER: trade_user
+      POSTGRES_PASSWORD: trade_password
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ../services/core-banking-service/src/main/resources/db/migration:/docker-entrypoint-initdb.d
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U trade_user -d trade_finance_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ==========================================
+  # Document Database: MongoDB 7
+  # Unstructured Shipping Docs, OCR Coordinates
+  # ==========================================
+  mongodb:
+    image: mongo:7.0
+    container_name: trade-mongodb
+    restart: unless-stopped
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: trade_mongo_user
+      MONGO_INITDB_ROOT_PASSWORD: trade_mongo_password
+      MONGO_INITDB_DATABASE: trade_finance_docs
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo_data:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ==========================================
+  # In-Memory Cache & Distributed Lock: Redis 7
+  # Redlock, Idempotency, Live Verification State
+  # ==========================================
+  redis:
+    image: redis:7-alpine
+    container_name: trade-redis
+    restart: unless-stopped
+    command: redis-server --appendonly yes
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ==========================================
+  # Distributed Streaming: Apache Kafka (KRaft mode)
+  # No Zookeeper needed! Lean and fast.
+  # ==========================================
+  kafka:
+    image: bashj79/kafka-kraft:latest
+    container_name: trade-kafka
+    restart: unless-stopped
+    ports:
+      - "9092:9092"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:29092,PLAINTEXT_HOST://0.0.0.0:9092
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+    volumes:
+      - kafka_data:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD-SHELL", "kafka-broker-api-versions.sh --bootstrap-server localhost:9092 || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+
+  # ==========================================
+  # Distributed Tracing: Zipkin
+  # Trace latency across Next.js -> Spring -> Kafka -> Python
+  # ==========================================
+  zipkin:
+    image: openzipkin/zipkin:latest
+    container_name: trade-zipkin
+    restart: unless-stopped
+    ports:
+      - "9411:9411"
+
+  # ==========================================
+  # Metrics Scraper: Prometheus
+  # ==========================================
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: trade-prometheus
+    restart: unless-stopped
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+
+  # ==========================================
+  # Observability Dashboard: Grafana
+  # ==========================================
+  grafana:
+    image: grafana/grafana:latest
+    container_name: trade-grafana
+    restart: unless-stopped
+    ports:
+      - "3001:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+    depends_on:
+      - prometheus
+    volumes:
+      - grafana_data:/var/lib/grafana
+
+  # ==========================================
+  # Core Banking Microservice (Spring Boot 3)
+  # ==========================================
+  core-banking-service:
+    build:
+      context: ../services/core-banking-service
+      dockerfile: Dockerfile
+    container_name: trade-core-banking
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/trade_finance_db
+      SPRING_DATA_MONGODB_URI: mongodb://trade_mongo_user:trade_mongo_password@mongodb:27017/trade_finance_docs?authSource=admin
+      SPRING_DATA_REDIS_HOST: redis
+      SPRING_KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      MANAGEMENT_ZIPKIN_TRACING_ENDPOINT: http://zipkin:9411/api/v2/spans
+    depends_on:
+      postgres:
+        condition: service_healthy
+      mongodb:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+
+  # ==========================================
+  # AI & OCR Microservice (FastAPI + LangGraph)
+  # ==========================================
+  ai-agent-service:
+    build:
+      context: ../services/ai-agent-service
+      dockerfile: Dockerfile
+    container_name: trade-ai-agent
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      REDIS_HOST: redis
+    depends_on:
+      redis:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+
+volumes:
+  postgres_data:
+  mongo_data:
+  redis_data:
+  kafka_data:
+  grafana_data:
